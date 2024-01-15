@@ -1,0 +1,153 @@
+####1. Load libraries####
+library(TSstudio)
+library(forecast)
+library(stats)
+library(magrittr)
+library(lubridate)
+library(tseries)
+library(Metrics)
+library(readxl)
+
+#load data from excel
+original_dengue <- read_excel("D:/D drive/SPECIAL RESOURCE CENTER/PROJECT/PROJECT 1 ARIMA DENGUE 2023/ML project 1/dengue data/PROJECT DENGUE 2023/Dengue_weekly_district_clean.xlsx",sheet="analysis")
+View(original_dengue)
+str(original_dengue)
+
+data_dengue_whole <- original_dengue[,2:12] #441
+data_dengue_traintest <- original_dengue[1:428,2:12] #428
+
+#--------------------------
+
+#1. Exploratory Data Analysis#
+data_dengue_traintest$Date <- ymd(data_dengue_traintest$Date) ; str(data_dengue_traintest)
+ts_data_dengue<- ts(data_dengue_traintest, start=2015, frequency = 52) # convert df to ts datatype
+
+ts_info(ts_data_dengue) #11 variables and 428 observations
+
+plot(ts_data_dengue[,c(2,4,6,8,10)]) #high case districts
+plot(ts_data_dengue[,c(3,5,7,9,11)]) #low case districts
+
+#2. Decompose and check for stationary
+
+#Johor Bharu
+ts_dengue_JB <- ts_data_dengue[,2]
+plot(decompose(ts_dengue_JB))
+
+#3. Split training and testing set (90/10 split)
+ts_train_JB <- window(ts_dengue_JB,
+                      start = time(ts_dengue_JB)[1],
+                      end = time(ts_dengue_JB)[384])
+
+ts_info(ts_train_JB)
+
+ts_test_JB <- window(ts_dengue_JB,
+                     start = time(ts_dengue_JB)[385],
+                     end = time(ts_dengue_JB)[428])
+
+ts_info(ts_test_JB)
+
+#----------------------------------------------------#
+#Baseline model
+
+#1. ETS
+
+JB_fit_ets <- ets(ts_train_JB)
+JB_fit_ets
+
+JB_fcst_ets <-forecast(JB_fit_ets,h=44)
+
+#Performance accuracy
+forecast::accuracy(JB_fcst_ets$mean,ts_test_JB)
+
+#.Plot
+plot(JB_fcst_ets,type = "l", col = "red", lwd = 2)
+lines(ts_dengue_JB, col = "blue", lwd = 2)
+
+#2. Holt-Winters
+
+JB_fit_hw <- HoltWinters(ts_train_JB,gamma=FALSE)
+
+JB_fcst_hw <- forecast(JB_fit_hw,h=44)
+
+#Performance accuracy
+forecast::accuracy(JB_fcst_hw$mean,ts_test_JB)
+
+#7.Plot
+plot(JB_fcst_hw,type = "l", col = "red", lwd = 2)
+lines(ts_dengue_JB, col = "blue", lwd = 2)
+
+#-------------------------------------------------------
+#ARIMA
+#1. Exploratory Dana Analysis
+par(mfrow=c(1,2))
+acf(ts_train_JB)
+pacf(ts_train_JB)
+plot(decompose(ts_train_JB))
+
+#ndiffs(ts_train_JB) #requires 1 differencing
+#nsdiffs(ts_train_JB) # requires 0 seasonal differencing
+
+ts_train_JB_diff1 <- diff(ts_train_JB, differences = 1) #differencing x1
+plot(decompose(ts_train_JB_diff1))
+acf(ts_train_JB_diff1, lag.max = 200)
+pacf(ts_train_JB_diff1,lag.max = 200)
+
+auto.arima(ts_train_JB)
+
+dev.off() 
+
+#2. Parameter grid search
+
+p <- q <- 0:5 #parameter search values
+P <- Q <- 0:1
+
+arima_grid <- expand.grid(p,q,P,Q)
+names(arima_grid) <- c("p", "q", "P", "Q")
+arima_grid$d <- 1
+arima_grid$D <- 0
+
+arima_grid$k <- rowSums(arima_grid)
+arima_grid <- arima_grid %>% filter(k <= 8) 
+
+arima_search <- lapply(1:nrow(arima_grid), function(i) {
+  tryCatch({
+    md <- arima(ts_train_JB, order = c(arima_grid$p[i], 1, arima_grid$q[i]),
+                seasonal = list(order = c(arima_grid$P[i], 0, arima_grid$Q[i])))
+    results <- data.frame(p = arima_grid$p[i], d = 1, q = arima_grid$q[i],
+                          P = arima_grid$P[i], D = 0, Q = arima_grid$Q[i],
+                          AIC = AIC(md))
+    
+    return(results)
+  }, error = function(e) {
+    # Print the error message
+    cat("Error for parameters:", arima_grid$p[i], arima_grid$q[i], arima_grid$P[i], arima_grid$Q[i], "\n")
+    # Return a data frame with NAs to indicate the error
+    return(data.frame(p = NA, d = NA, q = NA, P = NA, D = NA, Q = NA, AIC = NA))
+  })
+}) %>%
+  bind_rows() %>%
+  arrange(AIC)
+
+arima_search
+
+#3. Fit the best arima model
+JB_best_arima <- arima(ts_train_JB, order = c(5,1,1), seasonal = list(order =c(0,0,1)))
+
+#4. Performance evaluation
+JB_fcst_arima <- forecast(JB_best_arima, h = 44)
+
+
+test_forecast(ts_dengue_JB,
+              forecast.obj = JB_fcst_arima,
+              test = ts_test_JB)
+
+
+#5. Diagnostic check
+checkresiduals(JB_fcst_arima) #p-value = 0.2723 (residuals not correlated)
+
+#6. Prediction accuracy
+forecast::accuracy(JB_fcst_arima$mean,ts_test_JB)
+
+#7. Plot
+plot_forecast(JB_fcst_arima)
+lines(ts_test_JB, col = "blue", lwd = 2)
