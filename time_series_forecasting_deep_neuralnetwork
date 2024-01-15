@@ -1,0 +1,33 @@
+#This version
+#Data is transformed into log dengue case value, then normalized using mean and standard deviation of the log value. The model is then trained. Once model is build, prediction is made to evaluate the accuracy against test data. predicted value needs to be denormalized and then apply exponential.
+#mean and standard deviation used are for from 1:428 (whole dataset)
+#-----------------------------------------------------------------
+
+#install.packages("reticulate")
+library(reticulate)
+use_condaenv("ML-Workshop",required=TRUE)
+
+#install.packages("Rcpp")
+
+####1. Load libraries####
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(TSstudio)
+library(forecast)
+library(stats)
+library(magrittr)
+library(lubridate)
+library(tseries)
+library(nnfor)
+library(Metrics)
+library(tfdatasets)
+library(readxl)
+#load data from excel
+
+original_dengue <- read_excel("D:/D drive/SPECIAL RESOURCE CENTER/PROJECT/PROJECT 1 ARIMA DENGUE 2023/ML project 1/dengue data/PROJECT DENGUE 2023/Dengue_weekly_district_clean.xlsx",sheet="analysis")
+View(original_dengue)
+str(original_dengue)
+
+data_dengue_whole <- original_dengue[,2:12] #441
+data_dengue_traintest <- original_dengue[1:428,2:12] #428
