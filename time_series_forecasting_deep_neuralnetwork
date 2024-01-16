@@ -21,7 +21,7 @@ library(lubridate)
 library(tseries)
 library(nnfor)
 library(Metrics)
-library(tfdatasets)
+library(tfdatasets) #to create datasets for sliding window cross validation
 library(readxl)
 #load data from excel
 
@@ -31,3 +31,200 @@ str(original_dengue)
 
 data_dengue_whole <- original_dengue[,2:12] #441
 data_dengue_traintest <- original_dengue[1:428,2:12] #428
+
+#Johor Bharu
+JB_dengue <- data_dengue_traintest[,c(1,2)] 
+
+JB_dengue_case_log <- cbind(JB_dengue, log_JB = log(JB_dengue$`JOHOR BAHRU`)) 
+
+JB_dengue_log <- JB_dengue_case_log[,c(1,3)] # transform to log value to reduce the data variance (better fitting process)
+
+
+JB_dengue_log$log_JB[373] <- 4.627103 #(point 373 has -inf, imput using mean value)
+
+#Exploratory data analysis
+par(mfrow=c(2,1))
+
+plot(JB_dengue_log,type="l")
+plot(JB_dengue,type="l")
+
+#Split train, Validation and Test set
+num_train_samples <- 340 #60%
+num_val_samples <- 44 #20%
+num_test_samples <- 44 #20%
+
+train_df <- JB_dengue_log[seq(num_train_samples), ]
+val_df <- JB_dengue_log[seq(from = nrow(train_df) + 1,
+                        length.out = num_val_samples), ]
+test_df <- JB_dengue_log[seq(to = nrow(JB_dengue_log),
+                         length.out = num_test_samples), ]
+
+
+cat("num_train_samples:", nrow(train_df), "\n") #340 (80%)
+cat("num_val_samples:", nrow(val_df), "\n") # 44 (20%)
+cat("num_test_samples:", nrow(test_df), "\n") #44 (20%)
+
+#Data normalization
+input_data_colnames <- names(JB_dengue_log) %>%
+  setdiff(c("Date"))
+str(input_data_colnames)
+
+normalization_values <- #use value of whole dataset 
+  zip_lists(mean = lapply(JB_dengue_log[input_data_colnames], mean),
+            sd = lapply(JB_dengue_log[input_data_colnames], sd))
+
+normalize_input_data <- function(df) {
+  normalize <- function(x, center, scale)
+    (x - center) / scale
+  for(col_nm in input_data_colnames) {
+    col_nv <- normalization_values[[col_nm]]
+    df[[col_nm]] %<>% normalize(., col_nv$mean, col_nv$sd)
+  }
+  return(df)
+}
+
+# Determine significant lag to determine sequence length
+acf(JB_dengue[,2],lag.max = 100) # take 12 sequence
+
+
+#Create TF Dataset object that yields batches of data from the past 12 weeks along with a target dengue case 1 week in the future
+#instantiate three datasets: one for training, one for validation, and one for testing. 
+
+sampling_rate <- 1 #Observations will be sampled at each point
+sequence_length <- 12 #Observations will go back 12 weeks
+delay <- sampling_rate * (sequence_length + 1 - 1) #The target for a sequence will be the dengue case 1 week after the end of the sequence.(forecast horizon)
+batch_size <- 1
+
+#Create function to reshape the input and target data
+df_to_inputs_and_targets <- function(df) {
+  inputs <- df[input_data_colnames] %>%
+    normalize_input_data() %>%
+    as.matrix()
+  targets <- df[input_data_colnames] %>%
+    normalize_input_data() %>%
+    as.matrix()
+  list(
+    head(inputs, -delay),
+    tail(targets, -delay)
+  )
+}
+
+#Create function to make input and target sequence dataset
+make_dataset <- function(df) {
+  c(inputs, targets) %<-% df_to_inputs_and_targets(df)
+  timeseries_dataset_from_array(
+    inputs, targets,
+    sampling_rate = sampling_rate,
+    sequence_length = sequence_length,
+    shuffle = FALSE,
+    batch_size = batch_size
+  )
+}
+
+#Create the datasets
+train_dataset <- make_dataset(train_df)
+val_dataset <- make_dataset(val_df)
+test_dataset <- make_dataset(test_df)
+
+#Inspect input and target shape of one of the datasets
+c(samples, targets) %<-% iter_next(as_iterator(train_dataset))
+cat("samples shape: ", format(samples$shape), "\n",
+    "targets shape: ", format(targets$shape), "\n", sep = "")
+
+#View input and target for train data
+JB_dataset_iterator <- as_array_iterator(train_dataset)
+
+repeat {
+  batch <- iter_next(JB_dataset_iterator)
+  if (is.null(batch))
+    break
+  c(inputs, targets) %<-% batch
+  for (r in 1:nrow(inputs))
+    cat(sprintf("input: [ %s ] target: %s\n",
+                paste(inputs[r,,], collapse = " "), targets[r]))
+  cat(strrep("-", 27), "\n")
+}
+
+
+#View input and target for test data
+JB_dataset_iterator <- as_array_iterator(test_dataset)
+
+repeat {
+  batch <- iter_next(JB_dataset_iterator)
+  if (is.null(batch))
+    break
+  c(inputs, targets) %<-% batch
+  for (r in 1:nrow(inputs))
+    cat(sprintf("input: [ %s ] target: %s\n",
+                paste(inputs[r,,], collapse = " "), targets[r]))
+  cat(strrep("-", 27), "\n")
+}
+
+#Training and evaluating MLP model
+#1. Define
+ncol_input_data <- length(input_data_colnames) #1 variable
+
+inputs <- layer_input(shape = c(sequence_length, ncol_input_data))
+
+outputs <- inputs %>%
+  layer_flatten() %>%
+  layer_dense(16, activation = "relu") %>%
+  layer_dense(32, activation = "relu") %>% 
+  layer_dense(1)
+
+model_dense <- keras_model(inputs, outputs)
+callbacks_dense = list(
+  callback_model_checkpoint("JB_dense.keras",
+                            save_best_only = TRUE)
+)
+
+
+#2.Compile
+model_dense %>%
+  compile(optimizer_adam(learning_rate= 0.001, decay = 1e-6),
+          loss = "mse",
+          metrics = "mae")
+
+#3. Fit the model
+history_dense <- model_dense %>%
+  fit(train_dataset,
+      epochs = 30,
+      validation_data = val_dataset,
+      shuffle = FALSE,
+      callbacks = callbacks_dense)
+
+
+model_dense <- load_model_tf("JB_dense.keras") #save the best model
+sprintf("Test MAE: %.2f", keras::evaluate(model_dense, test_dataset)["mae"])
+
+#4. Forecast
+JB_fcst_dense <- predict(model_dense,test_dataset)
+
+#5. Rescale 
+JB_fcst_dense_num <- as.numeric(JB_fcst_dense)
+
+rescale_data <- function(data) {
+  mean_value <- normalization_values$log_JB[[1]]
+  std_dev <- normalization_values$log_JB[[2]]
+  
+  rescaled_data <- (data*std_dev)+ mean_value
+ } 
+  return(rescaled_data)
+}
+
+rescaled_JB_fcst_dense <- rescale_data(JB_fcst_dense_num)
+
+#6.Reverse log
+rescaled_reverse_JB_fcst_dense <- exp(rescaled_JB_fcst_dense)
+
+
+#7.Indexing for test data
+
+test_case <- exp(test_df$log_JB[13:33]) #first 12 data points for input data , then +21 generated target points=34, then -1 (0 indexing)
+
+#8. Plot test data and forecasted value
+plot(as.numeric(rescaled_reverse_JB_fcst_dense),type = "l", col = "blue", lwd = 2, xlim=c(0,25), ylim=c(50,200))
+lines(test_case , col = "red", lwd = 2)
+
+#9.Performance metrices
+forecast::accuracy(test_case,rescaled_reverse_JB_fcst_dense)
