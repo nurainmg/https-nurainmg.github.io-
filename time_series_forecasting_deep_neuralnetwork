@@ -219,7 +219,6 @@ rescaled_reverse_JB_fcst_dense <- exp(rescaled_JB_fcst_dense)
 
 
 #7.Indexing for test data
-
 test_case <- exp(test_df$log_JB[13:33]) #first 12 data points for input data , then +21 generated target points=34, then -1 (0 indexing)
 
 #8. Plot test data and forecasted value
