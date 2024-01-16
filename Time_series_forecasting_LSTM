@@ -1,0 +1,194 @@
+#This version
+#Actual case values are used in this model (not log), then normalized using mean and standard deviation. Model is then trained. Once model is build, prediction is made to evaluate the accuracy against test data. predicted value needs to be denormalized.
+#mean and standard deviation used are for from 1:428 (whole dataset)
+#-----------------------------------------------------------------
+
+#install.packages("reticulate")
+library(reticulate)
+use_condaenv("ML-Workshop",required=TRUE)
+
+#install.packages("Rcpp")
+
+####1. Load libraries####
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(TSstudio)
+library(forecast)
+library(stats)
+library(magrittr)
+library(lubridate)
+library(tseries)
+library(nnfor)
+library(Metrics)
+library(tfdatasets) #to create sequence dataset for rolling cross validation
+library(readxl)
+
+#Load data from excel
+original_dengue <- read_excel("D:/D drive/SPECIAL RESOURCE CENTER/PROJECT/PROJECT 1 ARIMA DENGUE 2023/ML project 1/dengue data/PROJECT DENGUE 2023/Dengue_weekly_district_clean.xlsx",sheet="analysis")
+View(original_dengue)
+str(original_dengue)
+
+data_dengue_whole <- original_dengue[,2:12] #441
+data_dengue_traintest <- original_dengue[1:428,2:12] #428
+
+#Johor Bharu
+JB_dengue <- data_dengue_traintest[,c(1,2)] 
+
+#Exploratory data analysis
+plot(JB_dengue,type="l")
+
+#Split train, validation and test set
+num_train_samples <- 340 #60%
+num_val_samples <- 44 #20%
+num_test_samples <- 44 #20%
+
+train_df <- JB_dengue[seq(num_train_samples), ]
+val_df <- JB_dengue[seq(from = nrow(train_df) + 1,
+                            length.out = num_val_samples), ]
+test_df <- JB_dengue[seq(to = nrow(JB_dengue),
+                             length.out = num_test_samples), ]
+
+cat("num_train_samples:", nrow(train_df), "\n") #340 (80%)
+cat("num_val_samples:", nrow(val_df), "\n") # 44 (20%)
+cat("num_test_samples:", nrow(test_df), "\n") #44 (20%)
+
+#Select column to be normalized
+input_data_colnames <- names(JB_dengue) %>%
+  setdiff(c("Date"))
+
+#Find the mean and standard deviation (using train+test dataset value)
+normalization_values <- 
+  zip_lists(mean = lapply(JB_dengue[input_data_colnames], mean),
+            sd = lapply(JB_dengue[input_data_colnames], sd))
+
+#Create function to normalize input data
+normalize_input_data <- function(df) {
+  normalize <- function(x, center, scale)
+    (x - center) / scale
+  for(col_nm in input_data_colnames) {
+    col_nv <- normalization_values[[col_nm]]
+    df[[col_nm]] %<>% normalize(., col_nv$mean, col_nv$sd)
+  }
+  return(df)
+}
+
+# Determine significant lag to determine sequence length
+acf(JB_dengue[,2],lag.max = 100) 
+
+
+#Create TF Dataset object that yields batches of data from the past 12 weeks along with a target dengue case 1 week in the future
+#instantiate three datasets: one for training, one for validation, and one for testing. 
+
+sampling_rate <- 1 #Observations will be sampled at each point
+sequence_length <- 12 #Observations will go back 6 weeks
+delay <- sampling_rate * (sequence_length + 1 - 1) #The target for a sequence will be the dengue case 1 week after the end of the sequence.(forecast horizon)
+batch_size <- 1
+
+#Create function to shape the input and target data
+df_to_inputs_and_targets <- function(df) {
+  inputs <- df[input_data_colnames] %>%
+    normalize_input_data() %>%
+    as.matrix()
+  targets <- df[input_data_colnames] %>%
+    normalize_input_data() %>%
+    as.matrix()
+  list(
+    head(inputs, -delay),
+    tail(targets, -delay)
+  )
+}
+
+#Create function to create dataset for input and target
+make_dataset <- function(df) {
+  c(inputs, targets) %<-% df_to_inputs_and_targets(df)
+  timeseries_dataset_from_array(
+    inputs, targets,
+    sampling_rate = sampling_rate,
+    sequence_length = sequence_length,
+    shuffle = FALSE,
+    batch_size = batch_size
+  )
+}
+
+train_dataset <- make_dataset(train_df)
+val_dataset <- make_dataset(val_df)
+test_dataset <- make_dataset(test_df)
+
+#Inspect sample and target shape of one of the datasets
+c(samples, targets) %<-% iter_next(as_iterator(train_dataset))
+cat("samples shape: ", format(samples$shape), "\n",
+    "targets shape: ", format(targets$shape), "\n", sep = "")
+
+#View input and target for train data
+JB_dataset_iterator <- as_array_iterator(train_dataset)
+
+repeat {
+  batch <- iter_next(JB_dataset_iterator)
+  if (is.null(batch))
+    break
+  c(inputs, targets) %<-% batch
+  for (r in 1:nrow(inputs))
+    cat(sprintf("input: [ %s ] target: %s\n",
+                paste(inputs[r,,], collapse = " "), targets[r]))
+  cat(strrep("-", 27), "\n")
+}
+
+#View input and target for test data
+JB_dataset_iterator <- as_array_iterator(test_dataset)
+
+repeat {
+  batch <- iter_next(JB_dataset_iterator)
+  if (is.null(batch))
+    break
+  c(inputs, targets) %<-% batch
+  for (r in 1:nrow(inputs))
+    cat(sprintf("input: [ %s ] target: %s\n",
+                paste(inputs[r,,], collapse = " "), targets[r]))
+  cat(strrep("-", 27), "\n")
+}
+
+#Training and evaluating LSTM model
+#1.Define
+inputs <- layer_input(shape = c(sequence_length, ncol_input_data))
+outputs <- inputs %>%
+  layer_lstm(8) %>%
+  layer_dense(1)
+
+model_lstm <- keras_model(inputs, outputs)
+callbacks_lstm <- list(callback_model_checkpoint("JB_lstm.keras",
+                                                 save_best_only = TRUE))
+
+#2.compile
+model_lstm %>% compile(optimizer_adam(learning_rate= 0.001, decay = 1e-6),
+                       loss = "mse",
+                       metrics = "mae")
+
+#3.Fit
+history_lstm <- model_lstm %>% fit(
+  train_dataset,
+  epochs = 30,
+  validation_data = val_dataset,
+  callbacks = callbacks_lstm
+)
+
+model_lstm <- load_model_tf("JB_lstm.keras")
+sprintf("Test MAE: %.2f", keras::evaluate(model_lstm, test_dataset)["mae"])
+
+#4. Forecast
+JB_fcst_lstm <- predict(model_lstm,test_dataset)
+
+
+#5. Rescale 
+rescaled_JB_fcst_lstm <- rescale_data(JB_fcst_lstm)
+rescaled_JB_fcst_lstm # 21 points
+
+#6.Indexing
+test_case <- test_df$`JOHOR BAHRU`[13:33]
+
+#7.Plot
+plot(as.numeric(rescaled_JB_fcst_lstm),type = "l", col = "blue", lwd = 2, xlim=c(0,40), ylim=c(50,200))
+lines(test_case, col = "red", lwd = 2)
+
+#8.Performance metrices
+forecast::accuracy(as.numeric(rescaled_JB_fcst_lstm),test_case)
